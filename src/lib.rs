@@ -2,7 +2,7 @@
 //!
 //! # Getting Started
 //!
-//! ```rust
+//! ```no_run
 //! use std::path::Path;
 //! use tokio_dl_stream_to_disk::AsyncDownload;
 //!
@@ -60,15 +60,16 @@ impl AsyncDownload {
         }
     }
 
-    /// Returns the length of the download in bytes.  This should be called after calling [`get`]
-    /// or [`download`].
+    /// Returns the length of the download in bytes. This should be called after calling
+    /// [`get`](Self::get) or [`download`](Self::download).
     pub fn length(&self) -> Option<u64> {
        self.length 
     }
 
     /// Get the download URL, but do not download it.  If successful, returns an `AsyncDownload`
-    /// object with a response stream, which you can then call [`download`] on.  After this, the
-    /// length of the download should also be known and you can call [`length`] on it.
+    /// object with a response stream, which you can then call [`download`](Self::download) on.
+    /// After this, the length of the download should also be known and you can call
+    /// [`length`](Self::length) on it.
     pub async fn get(mut self) -> Result<AsyncDownload, Box<dyn Error>> {
         self.get_non_consumable().await?;
         Ok(self)
@@ -96,9 +97,12 @@ impl AsyncDownload {
 
     /// Initiate the download and return a result.  Specify an optional callback.
     ///
+    /// A successful return means all downloaded bytes have been written and the file
+    /// has been flushed. This does not synchronize the file to disk for crash durability.
+    ///
     /// Arguments:
-    /// * `cb` - An optional callback for reporting information about the download asynchronously.
-    /// The callback takes the position of the current download, in bytes.
+    /// * `cb` - An optional callback receiving the number of bytes read from the response.
+    ///   Progress notifications do not imply completed file writes; only a successful return does.
     pub async fn download(&mut self, cb: &Option<Box<dyn Fn(u64) -> ()>>) -> Result<(), TDSTDError> {
         if self.response_stream.is_none() {
             self.get_non_consumable().await.map_err(|_| TDSTDError::new(TDSTDErrorKind::InvalidResponse))?;
@@ -123,11 +127,12 @@ impl AsyncDownload {
                     cb(num_bytes_total.try_into().unwrap());
                 }
                 if num_bytes > 0 {
-                    dest.write(&mut buf[0..num_bytes]).await?;
+                    dest.write_all(&buf[0..num_bytes]).await?;
                 } else {
                     break;
                 }
             }
+            dest.flush().await?;
             Ok(())
         } else {
             Err(TDSTDError::new(TDSTDErrorKind::DirectoryMissing))
@@ -136,12 +141,19 @@ impl AsyncDownload {
 
     #[cfg(feature="sha256sum")]
     /// Initiate the download and return a result with the sha256sum of the download contents.
-    /// Specify an optional callback.
+    /// Specify an optional callback. Like [`download`](Self::download), this method fetches
+    /// the response if [`get`](Self::get) has not been called first.
+    ///
+    /// A successful return means all downloaded bytes have been written and the file
+    /// has been flushed. This does not synchronize the file to disk for crash durability.
     ///
     /// Arguments:
-    /// * `cb` - An optional callback for reporting information about the download asynchronously.
-    /// The callback takes the position of the current download, in bytes.
+    /// * `cb` - An optional callback receiving the number of bytes read from the response.
+    ///   Progress notifications do not imply completed file writes; only a successful return does.
     pub async fn download_and_return_sha256sum(&mut self, cb: &Option<Box<dyn Fn(u64) -> ()>>) -> Result<Vec<u8>, TDSTDError> {
+        if self.response_stream.is_none() {
+            self.get_non_consumable().await.map_err(|_| TDSTDError::new(TDSTDErrorKind::InvalidResponse))?;
+        }
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let fname = self.dst_path.join(self.fname.clone());
@@ -163,12 +175,13 @@ impl AsyncDownload {
                     cb(num_bytes_total.try_into().unwrap());
                 }
                 if num_bytes > 0 {
-                    dest.write(&mut buf[0..num_bytes]).await?;
+                    dest.write_all(&buf[0..num_bytes]).await?;
                     hasher.update(&buf[0..num_bytes]);
                 } else {
                     break;
                 }
             }
+            dest.flush().await?;
             Ok(hasher.finalize().to_vec())
         } else {
             Err(TDSTDError::new(TDSTDErrorKind::DirectoryMissing))
