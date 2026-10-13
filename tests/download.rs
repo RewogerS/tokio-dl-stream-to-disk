@@ -68,7 +68,7 @@ impl Drop for Server {
     }
 }
 
-// Hold Tokio's sole blocking worker after File::create and before the first write.
+// Hold Tokio's sole blocking worker after the file open and before the first write.
 // A buffered write can return immediately, but flush must yield until the worker
 // is released. Release on Pending, or inspect the file on Ready *before* release.
 // This makes the completion regression deterministic without timing/sleep tricks.
@@ -241,6 +241,151 @@ impl Method {
     }
 }
 
+// With a prefetched response there is no await between the early path check
+// and the filesystem open. Occupy the only blocking worker, then manually poll
+// to enqueue that open. A competing entry is installed before releasing it.
+// No sleeps or scheduler races are involved, and the production open is used.
+#[derive(Clone, Copy)]
+enum CompetingEntry {
+    File,
+    Directory,
+    #[cfg(unix)]
+    Symlink,
+    #[cfg(unix)]
+    DanglingSymlink,
+}
+
+async fn assert_competing_creation(method: Method, entry: CompetingEntry) {
+    let mut server = Server::ok(b"abc").await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("download.bin");
+    let mut download = prepare(&server.url, directory.path(), true).await;
+    server.finish().await;
+    let (release, wait) = mpsc::channel();
+    let (entered, worker_entered) = mpsc::channel();
+    let worker = tokio::task::spawn_blocking(move || {
+        entered.send(()).unwrap();
+        let _ = wait.recv_timeout(TIMEOUT);
+    });
+    worker_entered.recv_timeout(TIMEOUT).unwrap();
+    let mut release = Some(release);
+    let callback = None;
+    let future = method.run(&mut download, &callback);
+    tokio::pin!(future);
+    let original = b"created by another downloader";
+    #[cfg(unix)]
+    let target = directory.path().join("target.bin");
+    let result = timeout(
+        TIMEOUT,
+        poll_fn(|cx| {
+            let result = future.as_mut().poll(cx);
+            if let Some(release) = release.take() {
+                assert!(result.is_pending(), "open must wait for the gated worker");
+                assert!(
+                    !path.exists(),
+                    "destination must be absent at the early check"
+                );
+                match entry {
+                    CompetingEntry::File => std::fs::write(&path, original).unwrap(),
+                    CompetingEntry::Directory => {
+                        std::fs::create_dir(&path).unwrap();
+                        std::fs::write(path.join("sentinel"), original).unwrap();
+                    }
+                    #[cfg(unix)]
+                    CompetingEntry::Symlink => {
+                        std::fs::write(&target, original).unwrap();
+                        std::os::unix::fs::symlink(&target, &path).unwrap();
+                    }
+                    #[cfg(unix)]
+                    CompetingEntry::DanglingSymlink => {
+                        std::os::unix::fs::symlink(&target, &path).unwrap();
+                    }
+                }
+                release.send(()).unwrap();
+            }
+            result
+        }),
+    )
+    .await
+    .expect("competing creation test timed out");
+    worker.await.unwrap();
+    match entry {
+        CompetingEntry::File => assert_eq!(std::fs::read(&path).unwrap(), original),
+        CompetingEntry::Directory => {
+            assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), original);
+        }
+        #[cfg(unix)]
+        CompetingEntry::Symlink => {
+            assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+        }
+        #[cfg(unix)]
+        CompetingEntry::DanglingSymlink => {
+            assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            assert!(
+                !target.exists(),
+                "competing dangling target must not be created"
+            );
+        }
+    }
+    assert!(matches!(result.unwrap_err().kind(), ErrorKind::FileExists));
+}
+
+#[test]
+fn download_rejects_competing_creation() {
+    completion_runtime().block_on(assert_competing_creation(
+        Method::Download,
+        CompetingEntry::File,
+    ));
+}
+
+#[cfg(feature = "sha256sum")]
+#[test]
+fn sha256_download_rejects_competing_creation() {
+    completion_runtime().block_on(assert_competing_creation(
+        Method::Sha256,
+        CompetingEntry::File,
+    ));
+}
+
+macro_rules! competing_tests {
+    ($plain:ident, $sha:ident, $entry:ident) => {
+        #[test]
+        fn $plain() {
+            completion_runtime().block_on(assert_competing_creation(
+                Method::Download,
+                CompetingEntry::$entry,
+            ));
+        }
+        #[cfg(feature = "sha256sum")]
+        #[test]
+        fn $sha() {
+            completion_runtime().block_on(assert_competing_creation(
+                Method::Sha256,
+                CompetingEntry::$entry,
+            ));
+        }
+    };
+}
+
+competing_tests!(
+    download_rejects_competing_directory,
+    sha256_rejects_competing_directory,
+    Directory
+);
+#[cfg(unix)]
+competing_tests!(
+    download_rejects_competing_symlink,
+    sha256_rejects_competing_symlink,
+    Symlink
+);
+#[cfg(unix)]
+competing_tests!(
+    download_rejects_competing_dangling_symlink,
+    sha256_rejects_competing_dangling_symlink,
+    DanglingSymlink
+);
+
 #[derive(Clone, Copy)]
 enum Payload {
     Small,
@@ -299,7 +444,12 @@ async fn assert_success(method: Method, payload: Payload) {
                 let positions = Rc::new(RefCell::new(Vec::new()));
                 let callback: Option<Box<dyn Fn(u64)>> = if with_callback {
                     let positions = Rc::clone(&positions);
+                    let path = path.clone();
                     Some(Box::new(move |position| {
+                        assert!(
+                            path.is_file(),
+                            "destination must be visible during progress"
+                        );
                         positions.borrow_mut().push(position)
                     }))
                 } else {
@@ -318,6 +468,16 @@ async fn assert_success(method: Method, payload: Payload) {
                     let positions = positions.borrow();
                     if with_callback {
                         assert_eq!(positions.last(), Some(&(body.len() as u64)));
+                        if body.is_empty() {
+                            assert_eq!(&*positions, &[0]);
+                        } else {
+                            assert!(positions.len() >= 2);
+                            assert_eq!(
+                                positions[positions.len() - 2],
+                                body.len() as u64,
+                                "EOF must repeat the final bytes-read notification"
+                            );
+                        }
                         assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
                         assert!(positions
                             .iter()
@@ -370,7 +530,9 @@ async fn assert_destination_error(method: Method, existing_file: bool) {
                 );
             }
             assert!(positions.borrow().is_empty());
-            server.finish().await;
+            if prefetched {
+                server.finish().await;
+            }
         })
         .await
         .expect("destination error test timed out");
@@ -473,44 +635,38 @@ async fn get_rejects_http_failure_without_creating_file() {
 }
 
 #[cfg(target_os = "linux")]
-async fn assert_write_failure(method: Method) {
-    use std::os::unix::fs::{symlink, FileTypeExt};
+async fn assert_device_symlink_rejected(method: Method) {
+    use std::os::unix::fs::symlink;
 
-    // /dev/full accepts opens but fails writes with ENOSPC. Check the fixture
-    // before following a symlink so a minimal container cannot create a real file in /dev.
-    let metadata =
-        std::fs::metadata("/dev/full").expect("Linux write-error fixture requires /dev/full");
-    assert!(
-        metadata.file_type().is_char_device(),
-        "/dev/full must be a character device"
-    );
+    // Existing symlinks must never be followed, even to writable devices.
+    // Write/flush error coverage lives in the shared production copy helper tests.
     timeout(TIMEOUT, async {
         let mut server = Server::ok(b"abc").await;
         let directory = tempfile::tempdir().unwrap();
         symlink("/dev/full", directory.path().join("download.bin")).unwrap();
         let mut download = prepare(&server.url, directory.path(), true).await;
         let error = method.run(&mut download, &None).await.unwrap_err();
+        assert!(matches!(error.kind(), ErrorKind::FileExists));
         assert_eq!(
-            error.into_inner_io().unwrap().raw_os_error(),
-            Some(28),
-            "expected Linux ENOSPC from writing /dev/full"
+            std::fs::read_link(directory.path().join("download.bin")).unwrap(),
+            Path::new("/dev/full")
         );
         server.finish().await;
     })
     .await
-    .expect("file write failure test timed out");
+    .expect("device symlink rejection test timed out");
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
-async fn download_reports_pending_write_failure() {
-    assert_write_failure(Method::Download).await;
+async fn download_rejects_prefetched_device_symlink() {
+    assert_device_symlink_rejected(Method::Download).await;
 }
 
 #[cfg(all(target_os = "linux", feature = "sha256sum"))]
 #[tokio::test(flavor = "current_thread")]
-async fn sha256_download_reports_pending_write_failure() {
-    assert_write_failure(Method::Sha256).await;
+async fn sha256_download_rejects_prefetched_device_symlink() {
+    assert_device_symlink_rejected(Method::Sha256).await;
 }
 
 #[cfg(feature = "sha256sum")]

@@ -16,7 +16,6 @@
 
 pub mod error;
 
-use std::convert::TryInto;
 use std::error::Error;
 use std::io::{Error as IOError, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -27,11 +26,43 @@ use futures_util::StreamExt;
 
 #[cfg(feature="sha256sum")]
 use sha2::{Sha256, Digest};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::io::StreamReader;
 
 use crate::error::{Error as TDSTDError, ErrorKind as TDSTDErrorKind};
 
 type S = dyn Stream<Item = Result<Bytes, IOError>> + Unpin;
+
+#[cfg(test)]
+mod copy_tests;
+
+// Shared by both download methods. The observer allows optional hashing without
+// a second copy loop or a public writer API; it sees only fully written chunks.
+async fn copy_stream<W: AsyncWrite + Unpin>(
+    stream: Box<S>,
+    dest: &mut W,
+    cb: &Option<Box<dyn Fn(u64)>>,
+    mut on_written: impl FnMut(&[u8]),
+) -> Result<(), TDSTDError> {
+    let mut http_async_reader = StreamReader::new(stream);
+    let mut buf = [0; 8 * 1024];
+    let mut num_bytes_total = 0u64;
+    loop {
+        let num_bytes = http_async_reader.read(&mut buf).await?;
+        if let Some(ref cb) = cb {
+            num_bytes_total += num_bytes as u64;
+            cb(num_bytes_total);
+        }
+        if num_bytes > 0 {
+            dest.write_all(&buf[0..num_bytes]).await?;
+            on_written(&buf[0..num_bytes]);
+        } else {
+            break;
+        }
+    }
+    dest.flush().await?;
+    Ok(())
+}
 
 /// The AsyncDownload struct allows you to stream the contents of a download to the disk.
 pub struct AsyncDownload {
@@ -95,48 +126,54 @@ impl AsyncDownload {
         Ok(())
     }
 
+    async fn create_destination(&mut self) -> Result<tokio::fs::File, TDSTDError> {
+        // Validate local paths before a lazy HTTP request. symlink_metadata also
+        // detects dangling links, unlike exists/is_file which follow the link.
+        if !self.dst_path.is_dir() {
+            return Err(TDSTDError::new(TDSTDErrorKind::DirectoryMissing));
+        }
+        let fname = self.dst_path.join(&self.fname);
+        match std::fs::symlink_metadata(&fname) {
+            Ok(_) => return Err(TDSTDError::new(TDSTDErrorKind::FileExists)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if self.response_stream.is_none() {
+            self.get_non_consumable().await.map_err(|_| TDSTDError::new(TDSTDErrorKind::InvalidResponse))?;
+        }
+        // The early check is only for fast local rejection. Exclusive creation
+        // is the authoritative no-overwrite check, including competing symlinks.
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(fname)
+            .await
+            .map_err(|error| {
+                if error.kind() == ErrorKind::AlreadyExists {
+                    TDSTDError::new(TDSTDErrorKind::FileExists)
+                } else {
+                    error.into()
+                }
+            })
+    }
+
     /// Initiate the download and return a result.  Specify an optional callback.
     ///
     /// A successful return means all downloaded bytes have been written and the file
     /// has been flushed. This does not synchronize the file to disk for crash durability.
     ///
+    /// Local destination validation precedes a lazy HTTP request. Any existing
+    /// destination entry (including a directory or dangling symlink) returns
+    /// `FileExists`; exclusive creation also prevents overwriting a competing entry.
+    /// The destination is visible during progress. Errors may leave a partial file;
+    /// this method does not publish atomically or delete the path on failure.
+    ///
     /// Arguments:
     /// * `cb` - An optional callback receiving the number of bytes read from the response.
     ///   Progress notifications do not imply completed file writes; only a successful return does.
     pub async fn download(&mut self, cb: &Option<Box<dyn Fn(u64) -> ()>>) -> Result<(), TDSTDError> {
-        if self.response_stream.is_none() {
-            self.get_non_consumable().await.map_err(|_| TDSTDError::new(TDSTDErrorKind::InvalidResponse))?;
-        }
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let fname = self.dst_path.join(self.fname.clone());
-        if fname.is_file() {
-            return Err(TDSTDError::new(TDSTDErrorKind::FileExists));
-        }
-
-        if self.dst_path.is_dir() {
-            let mut http_async_reader = StreamReader::new(self.response_stream.take().unwrap());
-
-            let mut dest = tokio::fs::File::create(fname).await?;
-            let mut buf = [0; 8 * 1024];
-            let mut num_bytes_total = 0;
-            loop {
-                let num_bytes = http_async_reader.read(&mut buf).await?;
-                if let Some(ref cb) = cb {
-                    num_bytes_total += num_bytes;
-                    cb(num_bytes_total.try_into().unwrap());
-                }
-                if num_bytes > 0 {
-                    dest.write_all(&buf[0..num_bytes]).await?;
-                } else {
-                    break;
-                }
-            }
-            dest.flush().await?;
-            Ok(())
-        } else {
-            Err(TDSTDError::new(TDSTDErrorKind::DirectoryMissing))
-        }
+        let mut dest = self.create_destination().await?;
+        copy_stream(self.response_stream.take().unwrap(), &mut dest, cb, |_| {}).await
     }
 
     #[cfg(feature="sha256sum")]
@@ -146,45 +183,17 @@ impl AsyncDownload {
     ///
     /// A successful return means all downloaded bytes have been written and the file
     /// has been flushed. This does not synchronize the file to disk for crash durability.
+    /// The destination validation, exclusive creation, visibility during progress
+    /// and possible partial file on failure are the same as [`download`](Self::download).
+    /// No digest is returned if reading, writing or flushing fails.
     ///
     /// Arguments:
     /// * `cb` - An optional callback receiving the number of bytes read from the response.
     ///   Progress notifications do not imply completed file writes; only a successful return does.
     pub async fn download_and_return_sha256sum(&mut self, cb: &Option<Box<dyn Fn(u64) -> ()>>) -> Result<Vec<u8>, TDSTDError> {
-        if self.response_stream.is_none() {
-            self.get_non_consumable().await.map_err(|_| TDSTDError::new(TDSTDErrorKind::InvalidResponse))?;
-        }
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let fname = self.dst_path.join(self.fname.clone());
-        if fname.is_file() {
-            return Err(TDSTDError::new(TDSTDErrorKind::FileExists));
-        }
-
-        if self.dst_path.is_dir() {
-            let mut http_async_reader = StreamReader::new(self.response_stream.take().unwrap());
-
-            let mut dest = tokio::fs::File::create(fname).await?;
-            let mut buf = [0; 8 * 1024];
-            let mut num_bytes_total = 0;
-            let mut hasher = Sha256::new();
-            loop {
-                let num_bytes = http_async_reader.read(&mut buf).await?;
-                if let Some(ref cb) = cb {
-                    num_bytes_total += num_bytes;
-                    cb(num_bytes_total.try_into().unwrap());
-                }
-                if num_bytes > 0 {
-                    dest.write_all(&buf[0..num_bytes]).await?;
-                    hasher.update(&buf[0..num_bytes]);
-                } else {
-                    break;
-                }
-            }
-            dest.flush().await?;
-            Ok(hasher.finalize().to_vec())
-        } else {
-            Err(TDSTDError::new(TDSTDErrorKind::DirectoryMissing))
-        }
+        let mut dest = self.create_destination().await?;
+        let mut hasher = Sha256::new();
+        copy_stream(self.response_stream.take().unwrap(), &mut dest, cb, |bytes| hasher.update(bytes)).await?;
+        Ok(hasher.finalize().to_vec())
     }
 }
